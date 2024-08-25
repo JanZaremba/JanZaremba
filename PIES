@@ -1,1 +1,358 @@
 
+# Check if the script is running as administrator
+if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {
+    # Prompt user for action
+    $choice = [System.Windows.Forms.MessageBox]::Show("Skript vyžaduje administrátorská práva. Chcete pokračovat?", "Administrátorská práva", [System.Windows.Forms.MessageBoxButtons]::YesNoCancel, [System.Windows.Forms.MessageBoxIcon]::Question)
+
+    switch ($choice) {
+        "Yes" {
+            # Prompt for username and password
+            $username = Read-Host "Zadejte uživatelské jméno"
+            $password = Read-Host "Zadejte heslo" -AsSecureString
+
+            # Create a credential object
+            $credential = New-Object System.Management.Automation.PSCredential($username, $password)
+
+            # Restart the script as administrator
+            Start-Process PowerShell -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`"" -Credential $credential -Verb RunAs
+            exit
+        }
+        "No" {
+            Write-Host "Skript byl zastaven uživatelem."
+            exit
+        }
+        "Cancel" {
+            Write-Host "Skript byl zastaven uživatelem."
+            exit
+        }
+    }
+}
+
+# Your script code here
+Write-Host "Skript běží jako administrátor."
+Add-Type -AssemblyName System.Windows.Forms
+
+# Constants for folder paths
+$BaseFolder = "C:\\Install\\inventář"
+
+# Function to show a message box
+function Show-Message {
+    param (
+        [string]$message,
+        [string]$title = "Informace"
+    )
+    [System.Windows.Forms.MessageBox]::Show($message, $title, [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) > $null
+}
+
+# Ensure directory exists
+function Ensure-Directory {
+    param ([string]$path)
+    if (-not (Test-Path -Path $path)) { New-Item -ItemType Directory -Path $path | Out-Null }
+}
+
+# Function to prompt user for network prefix
+function Get-NetworkPrefix {
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = "Síťový prefix"
+    $form.Size = New-Object System.Drawing.Size(300, 200)
+    $form.StartPosition = "CenterScreen"
+
+    $label = New-Object System.Windows.Forms.Label
+    $label.Text = "Zadejte síťový prefix `n*Hlad. 10.73.74. `n*Daň 10.73.58/59. `n*Lada 10.73.50. `n*Ben 10.73.40."
+    $label.AutoSize = $true
+    $label.Location = New-Object System.Drawing.Point(10, 20)
+    $form.Controls.Add($label)
+
+    $textBox = New-Object System.Windows.Forms.TextBox
+    $textBox.Size = New-Object System.Drawing.Size(60, 20)
+    $textBox.Location = New-Object System.Drawing.Point(10, 100)
+    $form.Controls.Add($textBox)
+
+    $buttonOk = New-Object System.Windows.Forms.Button
+    $buttonOk.Text = "OK"
+    $buttonOk.Location = New-Object System.Drawing.Point(200, 100)
+    $buttonOk.Add_Click({
+        if ($textBox.Text -match '^\d{1,3}\.\d{1,3}\.\d{1,3}\.$') {
+            $form.Close()
+        } else {
+            [System.Windows.Forms.MessageBox]::Show("Neplatná IP adresa. Zkuste to znovu.", "Chyba", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error) > $null
+        }
+    })
+    $form.Controls.Add($buttonOk)
+
+    $buttonChange = New-Object System.Windows.Forms.Button
+    $buttonChange.Text = "Změna"
+    $buttonChange.Location = New-Object System.Drawing.Point(120, 100)
+    $buttonChange.Add_Click({ $textBox.Text = "" })
+    $form.Controls.Add($buttonChange)
+
+    $form.AcceptButton = $buttonOk
+    $form.ShowDialog() | Out-Null
+
+    return $textBox.Text
+}
+
+# Prompt user for network prefix
+$networkPrefix = Get-NetworkPrefix
+$startRange = 1
+$endRange = 254
+
+# Initialize directory structure
+Ensure-Directory -path $BaseFolder
+$outputFile = "${BaseFolder}\\aktivni_adresy.txt"
+$logFile = "${BaseFolder}\\contacted_addresses.log"
+$timestamp = (Get-Date).ToString("yyyyMMdd_HHmmss_fff")
+$csvFile = "${BaseFolder}\\devices_$timestamp.csv"
+$excelFile = "${BaseFolder}\\devices.xlsx"
+
+# Load previously contacted IP addresses
+$contactedIPs = if (Test-Path -Path $logFile) { Get-Content -Path $logFile } else { @() }
+
+# Generate list of IP addresses
+$ipAddresses = @()
+for ($i = $startRange; $i -le $endRange; $i++) {
+    $ipAddresses += "$networkPrefix$i"
+}
+
+# Run nmap for IP address availability scanning
+Show-Message "Spuštění skenování dostupnosti IP adres pomocí Nmap..." "Skenování IP adres"
+$nmapOutput = nmap -sn $ipAddresses
+$activeIPs = $nmapOutput | Select-String -Pattern "Nmap scan report for" | ForEach-Object { $_.ToString().Replace("Nmap scan report for ", "").Trim() }
+
+# Save active IPs to file
+$activeIPs | Out-File -FilePath $outputFile
+
+# Calculate estimated scan time for active IPs
+$activeIPCount = $activeIPs.Count
+$estimatedTimeSeconds = $activeIPCount * 3
+$estimatedTimeMinutes = [math]::Ceiling($estimatedTimeSeconds / 60)
+
+# Display estimated scan time for active IPs
+Show-Message "Odhadovaný minimální čas skenování aktivních IP adres: $estimatedTimeMinutes minut/y." "Odhadovaný čas skenování"
+Write-Host "Odhadovaný minimální čas skenování aktivních IP adres: $estimatedTimeMinutes minut/y."
+
+# Function to get device type based on open ports
+function Get-DeviceType {
+    param (
+        [string]$scanLine
+    )
+
+    if ($scanLine -match "9100/tcp open" -or $scanLine -match "631/tcp open" -or $scanLine -match "515/tcp open" -or $scanLine -match "80/tcp open") {
+        if ($scanLine -match "9100/tcp open") { return "Printer (Port 9100 - RAW)"; }
+        if ($scanLine -match "631/tcp open") { return "Printer (Port 631 - IPP)"; }
+        if ($scanLine -match "515/tcp open") { return "Printer (Port 515 - LPD)"; }
+        if ($scanLine -match "80/tcp open") { return "Printer (Port 80 - HTTP)"; }
+    }
+    return "Computer"
+}
+
+# Function to get the computer serial number
+function Get-ComputerSerialNumber {
+    param (
+        [string]$computerName
+    )
+    
+    try {
+        $serialNumber = Get-WmiObject -Class Win32_BIOS -ComputerName $computerName -ErrorAction Stop | Select-Object -ExpandProperty SerialNumber
+    } catch {
+        $serialNumber = "N/A"
+    }
+    return $serialNumber
+}
+
+# Function to get monitor serial numbers
+function Get-MonitorSerialNumbers {
+    param (
+        [string]$computerName
+    )
+
+    try {
+        $monitors = Get-WmiObject -Namespace root\wmi -Class WmiMonitorID -ComputerName $computerName -ErrorAction Stop
+        $serialNumbers = @()
+        foreach ($monitor in $monitors) {
+            $serialNumber = ($monitor.SerialNumberID | ForEach-Object { [char]$_ }) -join ""
+            $serialNumbers += $serialNumber
+        }
+        if ($serialNumbers.Count -eq 0) {
+            return "N/A"
+        }
+    } catch {
+        return "N/A"
+    }
+    return $serialNumbers -join ", "
+}
+
+# Function to test computer availability
+function Test-ComputerAvailability {
+    param (
+        [string]$ipAddress
+    )
+
+    try {
+        Test-Connection -ComputerName $ipAddress -Count 1 -Quiet -ErrorAction Stop
+    } catch {
+        return $false
+    }
+    return $true
+}
+
+# Function to get logged in user
+function Get-LoggedInUser {
+    param (
+        [string]$computerName
+    )
+
+    try {
+        $user = Get-WmiObject -Class Win32_ComputerSystem -ComputerName $computerName -ErrorAction Stop | Select-Object -ExpandProperty UserName
+                if ($null -eq $user) {
+            return "N/A"
+        }
+    } catch {
+        return "N/A"
+    }
+    return $user
+}
+
+# Function to get system uptime
+function Get-Uptime {
+    param (
+        [string]$computerName
+    )
+
+    try {
+        $os = Get-WmiObject -Class Win32_OperatingSystem -ComputerName $computerName -ErrorAction Stop
+        $lastBootUpTime = $os.ConvertToDateTime($os.LastBootUpTime)
+        $uptime = (Get-Date) - $lastBootUpTime
+        $uptime = "{0:dd} dní {0:hh} hodin {0:mm} minut" -f $uptime
+    } catch {
+        $uptime = "N/A"
+    }
+    return $uptime
+}
+
+# Function to get USB printers
+function Get-UsbPrinters {
+    param (
+        [string]$computerName
+    )
+
+    try {
+        $usbPrinters = Get-WmiObject -Query "SELECT * FROM Win32_Printer WHERE PortName LIKE 'USB%'" -ComputerName $computerName -ErrorAction Stop | Select-Object -ExpandProperty Name
+        if ($usbPrinters -eq $null -or $usbPrinters.Count -eq 0) {
+            return "N/A"
+        }
+    } catch {
+        return "N/A"
+    }
+    return $usbPrinters -join ", "
+}
+
+# Process scan results
+Show-Message "Zpracování aktivních IP adres..." "Zpracování IP adres"
+$devices = @()
+
+foreach ($ipAddress in $activeIPs) {
+    if ($contactedIPs -notcontains $ipAddress) {
+        $startTime = Get-Date
+
+        $job = Start-Job -ScriptBlock {
+            param ($ip)
+            Test-Connection -ComputerName $ip -Count 1 -ErrorAction SilentlyContinue
+        } -ArgumentList $ipAddress
+
+        if (Wait-Job -Job $job -Timeout 6) {
+            $pingResult = Receive-Job -Job $job
+            $endTime = Get-Date
+
+            $scanTime = ($endTime - $startTime).TotalSeconds
+            Write-Host "Skenování IP adresy $ipAddress trvalo $scanTime sekund."
+
+            if ($pingResult) {
+                $serialNumber = Get-ComputerSerialNumber -computerName $ipAddress
+                if ($serialNumber -eq "N/A") {
+                    Write-Host "Nepodařilo se načíst sériové číslo pro $ipAddress. Přeskočení."
+                    continue
+                }
+
+                $deviceType = Get-DeviceType -scanLine $ipAddress
+                $monitorSerialNumbers = Get-MonitorSerialNumbers -computerName $ipAddress
+                $loggedInUser = Get-LoggedInUser -computerName $ipAddress
+                $uptime = Get-Uptime -computerName $ipAddress
+                $usbPrinters = Get-UsbPrinters -computerName $ipAddress
+
+                $device = [PSCustomObject]@{
+                    IPAddress = $ipAddress
+                    DeviceType = $deviceType
+                    SerialNumber = $serialNumber
+                    MonitorSerialNumbers = $monitorSerialNumbers
+                    LoggedInUser = $loggedInUser
+                    Uptime = $uptime
+                    USBPrinters = $usbPrinters
+                    ScanTime = $scanTime
+                }
+                $devices += $device
+                Add-Content -Path $logFile -Value $ipAddress
+            }
+        } else {
+            Write-Host "Skenování IP adresy $ipAddress trvá příliš dlouho. Přeskočení za 5 sekund."
+            $timeout = 5
+            while ($timeout -gt 0) {
+                Write-Host "Čekání: $timeout sekund"
+                Start-Sleep -Seconds 1
+                $timeout--
+            }
+            Show-Message "Skenování $ipAddress trvalo příliš dlouho. Přeskočeno." "Přeskočeno"
+        }
+
+        Remove-Job -Job $job
+    }
+}
+
+# Export to CSV
+$devices | Export-Csv -Path $csvFile -NoTypeInformation
+
+# Export to Excel (if module is available)
+if (Get-Module -ListAvailable -Name ImportExcel) {
+    # Check if the devices.xlsx file exists, if not, create it
+    if (-not (Test-Path -Path $excelFile)) {
+        # Create a new Excel file with a header row
+        $headers = @("IPAddress", "DeviceType", "SerialNumber", "MonitorSerialNumbers", "LoggedInUser", "Uptime", "USBPrinters", "ScanTime")
+        $headers | Export-Csv -Path $csvFile -NoTypeInformation
+
+        # Convert CSV to Excel
+        Import-Csv -Path $csvFile | Export-Excel -Path $excelFile -WorksheetName "Devices"
+        Remove-Item -Path $csvFile -Force
+    }
+
+    $excel = Open-ExcelPackage -Path $excelFile
+    if ($null -eq $excel) {
+        Write-Error "ExcelPackage object is null."
+    } else {
+        $worksheet = $excel.Workbook.Worksheets["Devices"]
+        if ($null -eq $worksheet) {
+            Write-Error "Worksheet 'Devices' does not exist."
+        } else {
+            $startRow = $worksheet.Dimension.End.Row + 1
+
+            $devices | Select-Object -Property * -ExcludeProperty Length | Export-Excel -ExcelPackage $excel -WorksheetName "Devices" -StartRow $startRow -NoHeader
+
+            Close-ExcelPackage $excel
+        }
+    }
+} else {
+    Show-Message "Excel modul není nainstalován. Výsledky byly uloženy pouze do CSV souboru: $csvFile." "Upozornění"
+}
+
+# Add signature to the CSV file
+Add-Content -Path $csvFile -Value "`nTento soubor byl vygenerován pomocí umělé inteligence."
+
+# Add signature to the Excel file (if module is available)
+if (Get-Module -ListAvailable -Name ImportExcel) {
+    $excel = Open-ExcelPackage -Path $excelFile
+    $worksheet = $excel.Workbook.Worksheets["Devices"]
+    $lastRow = $worksheet.Dimension.End.Row + 1
+    $worksheet.Cells[$lastRow, 1].Value = "Tento soubor byl vygenerován pomocí umělé inteligence."
+    Close-ExcelPackage $excel
+}
+
+Show-Message "Skenování dokončeno. Výsledky byly uloženy do  : $excelFile." "Dokončeno"
